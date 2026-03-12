@@ -44,10 +44,10 @@ node measure-lcp.js https://zora.co --json
 ```
 URL: https://zora.co
 First Feed Image: 4371ms (poor)
-Dimensions: 1024x1024
+Dimensions: 1080x1350
 
 Image:
-  .../rs:fill:1200:1200/g:ce/f:webp/aHR0cHM6Ly9tYWdpYy5...
+  .../rs:fill:1200:1500/g:ce/f:webp/aHR0cHM6Ly9tYWdpYy5...
 
 Thresholds: good ≤2500ms, poor >4000ms
 ```
