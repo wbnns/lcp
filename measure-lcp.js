@@ -90,57 +90,48 @@ async function measureFeedImage(url, options = {}) {
     await page.setViewport({ width: 1920, height: 1080 });
   }
 
-  // Track when the first priority feed image loads
+  // Track when the first CDN image loads
   await page.evaluateOnNewDocument(() => {
     window.__FEED_PERF__ = {
       navigationStart: performance.now(),
-      firstFeedImage: null,
-      imageLoadTimes: []
+      firstFeedImage: null
     };
 
-    // Watch for the first priority image (the feed's first image)
+    // Watch for CDN images as they're added to the DOM
     const observer = new MutationObserver((mutations) => {
+      if (window.__FEED_PERF__.firstFeedImage) return; // Already found one
+
       for (const mutation of mutations) {
         for (const node of mutation.addedNodes) {
-          if (node.nodeType === Node.ELEMENT_NODE) {
-            // Look for priority images (first feed item)
-            const imgs = node.tagName === 'IMG' ? [node] : node.querySelectorAll?.('img') || [];
-            for (const img of imgs) {
-              const src = img.src || '';
-              const isPriority = img.fetchPriority === 'high' || img.loading === 'eager';
-              const isCDN = src.includes('choicecdn.com') ||
-                           src.includes('decentralized-content.com') ||
-                           src.includes('ipfs');
+          if (node.nodeType !== Node.ELEMENT_NODE) continue;
 
-              if (isPriority && isCDN && !window.__FEED_PERF__.firstFeedImage) {
-                const startTime = performance.now();
+          const imgs = node.tagName === 'IMG' ? [node] : (node.querySelectorAll?.('img') || []);
 
-                if (img.complete) {
-                  window.__FEED_PERF__.firstFeedImage = {
-                    loadedAt: startTime,
-                    src: src,
-                    wasComplete: true
-                  };
-                } else {
-                  img.addEventListener('load', () => {
-                    if (!window.__FEED_PERF__.firstFeedImage) {
-                      window.__FEED_PERF__.firstFeedImage = {
-                        loadedAt: performance.now(),
-                        src: src,
-                        wasComplete: false
-                      };
-                    }
-                  }, { once: true });
+          for (const img of imgs) {
+            const src = img.src || '';
+            const isCDN = src.includes('choicecdn.com');
 
-                  img.addEventListener('error', () => {
-                    window.__FEED_PERF__.imageLoadTimes.push({
+            if (isCDN && !window.__FEED_PERF__.firstFeedImage) {
+              if (img.complete && img.naturalWidth > 0) {
+                // Already loaded
+                window.__FEED_PERF__.firstFeedImage = {
+                  loadedAt: performance.now(),
+                  src: src,
+                  wasComplete: true
+                };
+              } else {
+                // Wait for load
+                img.addEventListener('load', () => {
+                  if (!window.__FEED_PERF__.firstFeedImage) {
+                    window.__FEED_PERF__.firstFeedImage = {
+                      loadedAt: performance.now(),
                       src: src,
-                      error: true,
-                      time: performance.now()
-                    });
-                  }, { once: true });
-                }
+                      wasComplete: false
+                    };
+                  }
+                }, { once: true });
               }
+              return; // Stop after finding first CDN image
             }
           }
         }
@@ -183,7 +174,7 @@ async function measureFeedImage(url, options = {}) {
     await new Promise(r => setTimeout(r, 100));
   }
 
-  // Also get Resource Timing data for the image
+  // Get Resource Timing data for the image
   let resourceTiming = null;
   if (result?.src) {
     resourceTiming = await page.evaluate((imgSrc) => {
@@ -286,7 +277,7 @@ async function main() {
     if (json) {
       console.log(JSON.stringify({ error: 'No feed images detected' }));
     } else {
-      console.error('Failed to detect feed images (no priority images with CDN src found)');
+      console.error('Failed to detect feed images');
     }
     process.exit(1);
   }
