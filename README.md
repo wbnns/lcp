@@ -1,6 +1,10 @@
 # lcp
 
-Measure time to first image load for any URL using headless Chrome. Designed for image-heavy feeds like zora.co.
+Measure time to first feed image for zora.co using headless Chrome.
+
+## What it measures
+
+Specifically tracks the **first priority image in the feed** - the image with `fetchpriority="high"` and `loading="eager"` from the CDN (choicecdn.com). This is the first post's image that users see when the feed loads.
 
 ## Install
 
@@ -35,21 +39,12 @@ node measure-lcp.js https://zora.co --mobile
 node measure-lcp.js https://zora.co --json
 ```
 
-## Options
-
-| Option | Alias | Description |
-|--------|-------|-------------|
-| `--runs <n>` | `-r` | Number of runs to average |
-| `--mobile` | `-m` | Emulate mobile device (iPhone 12) |
-| `--json` | `-j` | Output as JSON |
-| `--help` | `-h` | Show help |
-
 ## Output
 
 ```
 URL: https://zora.co
-First Image: 1847ms (good)
-Download: 423ms
+First Feed Image: 1847ms (good)
+Download Time: 423ms
 Size: 112.3 KB
 
 Image:
@@ -58,24 +53,14 @@ Image:
 Thresholds: good ≤2500ms, poor >4000ms
 ```
 
-## What it measures
-
-- **First Image**: Time from navigation start until the first CDN image finishes loading
-- **Download**: How long the image took to download (network time)
-- **Size**: Encoded size of the image
-
-Tracks images from:
-- `choicecdn.com` (imgproxy CDN)
-- `decentralized-content.com`
-- IPFS URLs
-
 ## How it works
 
-1. Launches headless Chrome
-2. Injects Resource Timing API observers before navigation
-3. Navigates to the URL
-4. Waits for the first CDN image to load
-5. Reports timing from the Resource Timing API
+1. Uses MutationObserver to watch for `<img>` elements as they're added to the DOM
+2. Identifies the first image with:
+   - `fetchpriority="high"` OR `loading="eager"`
+   - Source URL containing `choicecdn.com`, `decentralized-content.com`, or `ipfs`
+3. Attaches a load event listener to capture when the image finishes loading
+4. Reports the time from navigation start to image load completion
 
 ## Thresholds
 

@@ -55,9 +55,9 @@ Examples:
 `);
 }
 
-function getRating(lcp) {
-  if (lcp <= THRESHOLDS.good) return 'good';
-  if (lcp <= THRESHOLDS.needsImprovement) return 'needs-improvement';
+function getRating(time) {
+  if (time <= THRESHOLDS.good) return 'good';
+  if (time <= THRESHOLDS.needsImprovement) return 'needs-improvement';
   return 'poor';
 }
 
@@ -74,14 +74,9 @@ const RESET = '\x1b[0m';
 const DIM = '\x1b[2m';
 const BOLD = '\x1b[1m';
 
-// Default stability settings
-const STABILITY = {
-  timeout: 20000,        // Max time to wait for stable LCP
-  stableThreshold: 2000, // LCP must not change for this long
-  pollInterval: 200      // How often to check stability
-};
+const TIMEOUT = 30000;
 
-async function measureLCP(url, options = {}) {
+async function measureFeedImage(url, options = {}) {
   const browser = await puppeteer.launch({
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
@@ -95,86 +90,67 @@ async function measureLCP(url, options = {}) {
     await page.setViewport({ width: 1920, height: 1080 });
   }
 
-  // Inject tracking before navigation
+  // Track when the first priority feed image loads
   await page.evaluateOnNewDocument(() => {
-    window.__PERF__ = {
+    window.__FEED_PERF__ = {
       navigationStart: performance.now(),
-
-      // LCP tracking
-      lcp: {
-        entries: [],
-        lastChangeTime: Date.now()
-      },
-
-      // Image tracking (for feed mode)
-      images: {
-        started: [],   // { url, startTime }
-        completed: [], // { url, startTime, endTime, duration, size, cached }
-        failed: []     // { url, startTime, error }
-      },
-
-      // Network tracking
-      pendingFetches: 0,
-      pendingXHR: 0
+      firstFeedImage: null,
+      imageLoadTimes: []
     };
 
-    // Track LCP
-    new PerformanceObserver((list) => {
-      for (const entry of list.getEntries()) {
-        window.__PERF__.lcp.entries.push(entry);
-        window.__PERF__.lcp.lastChangeTime = Date.now();
-      }
-    }).observe({ type: 'largest-contentful-paint', buffered: true });
+    // Watch for the first priority image (the feed's first image)
+    const observer = new MutationObserver((mutations) => {
+      for (const mutation of mutations) {
+        for (const node of mutation.addedNodes) {
+          if (node.nodeType === Node.ELEMENT_NODE) {
+            // Look for priority images (first feed item)
+            const imgs = node.tagName === 'IMG' ? [node] : node.querySelectorAll?.('img') || [];
+            for (const img of imgs) {
+              const src = img.src || '';
+              const isPriority = img.fetchPriority === 'high' || img.loading === 'eager';
+              const isCDN = src.includes('choicecdn.com') ||
+                           src.includes('decentralized-content.com') ||
+                           src.includes('ipfs');
 
-    // Track image loads via PerformanceObserver
-    new PerformanceObserver((list) => {
-      for (const entry of list.getEntries()) {
-        if (entry.initiatorType === 'img') {
-          const isCDN = entry.name.includes('choicecdn.com') ||
-                        entry.name.includes('decentralized-content.com') ||
-                        entry.name.includes('ipfs');
+              if (isPriority && isCDN && !window.__FEED_PERF__.firstFeedImage) {
+                const startTime = performance.now();
 
-          window.__PERF__.images.completed.push({
-            url: entry.name,
-            startTime: entry.startTime,
-            endTime: entry.responseEnd,
-            duration: entry.responseEnd - entry.startTime,
-            transferSize: entry.transferSize,
-            encodedSize: entry.encodedBodySize,
-            cached: entry.transferSize === 0,
-            isCDN
-          });
+                if (img.complete) {
+                  window.__FEED_PERF__.firstFeedImage = {
+                    loadedAt: startTime,
+                    src: src,
+                    wasComplete: true
+                  };
+                } else {
+                  img.addEventListener('load', () => {
+                    if (!window.__FEED_PERF__.firstFeedImage) {
+                      window.__FEED_PERF__.firstFeedImage = {
+                        loadedAt: performance.now(),
+                        src: src,
+                        wasComplete: false
+                      };
+                    }
+                  }, { once: true });
+
+                  img.addEventListener('error', () => {
+                    window.__FEED_PERF__.imageLoadTimes.push({
+                      src: src,
+                      error: true,
+                      time: performance.now()
+                    });
+                  }, { once: true });
+                }
+              }
+            }
+          }
         }
       }
-    }).observe({ type: 'resource', buffered: true });
+    });
 
-    // Track fetch requests
-    const origFetch = window.fetch;
-    window.fetch = async (...args) => {
-      window.__PERF__.pendingFetches++;
-      try {
-        return await origFetch(...args);
-      } finally {
-        window.__PERF__.pendingFetches--;
-      }
-    };
-
-    // Track XHR requests
-    const origXHROpen = XMLHttpRequest.prototype.open;
-    const origXHRSend = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open = function(...args) {
-      this.__tracked__ = true;
-      return origXHROpen.apply(this, args);
-    };
-    XMLHttpRequest.prototype.send = function(...args) {
-      if (this.__tracked__) {
-        window.__PERF__.pendingXHR++;
-        this.addEventListener('loadend', () => {
-          window.__PERF__.pendingXHR--;
-        }, { once: true });
-      }
-      return origXHRSend.apply(this, args);
-    };
+    observer.observe(document.documentElement, {
+      childList: true,
+      subtree: true
+    });
   });
 
   const startTime = Date.now();
@@ -186,65 +162,60 @@ async function measureLCP(url, options = {}) {
     throw new Error(`Failed to load ${url}: ${err.message}`);
   }
 
-  // Wait for first CDN image to load
-  const stabilityStart = Date.now();
-  let stable = false;
+  // Wait for first feed image to load
+  const pollStart = Date.now();
+  let result = null;
 
-  while (Date.now() - stabilityStart < STABILITY.timeout) {
-    const state = await page.evaluate(() => {
-      const perf = window.__PERF__;
-      const cdnImages = perf.images.completed.filter(img => img.isCDN);
-
-      return {
-        pendingFetches: perf.pendingFetches,
-        pendingXHR: perf.pendingXHR,
-        cdnImages: cdnImages.length
-      };
+  while (Date.now() - pollStart < TIMEOUT) {
+    result = await page.evaluate(() => {
+      const perf = window.__FEED_PERF__;
+      if (perf.firstFeedImage) {
+        return {
+          time: Math.round(perf.firstFeedImage.loadedAt),
+          src: perf.firstFeedImage.src,
+          wasAlreadyComplete: perf.firstFeedImage.wasComplete
+        };
+      }
+      return null;
     });
 
-    const pendingRequests = state.pendingFetches + state.pendingXHR;
-
-    // Done when first CDN image loads and no pending requests
-    if (state.cdnImages >= 1 && pendingRequests === 0) {
-      stable = true;
-      break;
-    }
-
-    await new Promise(r => setTimeout(r, STABILITY.pollInterval));
+    if (result) break;
+    await new Promise(r => setTimeout(r, 100));
   }
 
-  // Extract first image timing
-  const perfData = await page.evaluate(() => {
-    const perf = window.__PERF__;
-
-    // Get first CDN image (sorted by load completion time)
-    const cdnImages = perf.images.completed
-      .filter(img => img.isCDN)
-      .sort((a, b) => a.endTime - b.endTime);
-
-    const firstImage = cdnImages[0];
-
-    return {
-      firstImage: firstImage ? {
-        time: Math.round(firstImage.endTime),
-        duration: Math.round(firstImage.duration),
-        size: firstImage.encodedSize,
-        cached: firstImage.cached,
-        url: firstImage.url
-      } : null,
-      totalCDNImages: cdnImages.length,
-      totalImages: perf.images.completed.length
-    };
-  });
+  // Also get Resource Timing data for the image
+  let resourceTiming = null;
+  if (result?.src) {
+    resourceTiming = await page.evaluate((imgSrc) => {
+      const entries = performance.getEntriesByType('resource');
+      const entry = entries.find(e => e.name === imgSrc);
+      if (entry) {
+        return {
+          duration: Math.round(entry.duration),
+          transferSize: entry.transferSize,
+          encodedSize: entry.encodedBodySize,
+          cached: entry.transferSize === 0
+        };
+      }
+      return null;
+    }, result.src);
+  }
 
   const loadTime = Date.now() - startTime;
 
   await browser.close();
 
+  if (!result) {
+    throw new Error('Timed out waiting for first feed image');
+  }
+
   return {
-    ...perfData,
+    time: result.time,
+    src: result.src,
+    duration: resourceTiming?.duration || null,
+    size: resourceTiming?.encodedSize || null,
+    cached: resourceTiming?.cached || false,
     loadTime,
-    stable,
     timestamp: new Date().toISOString()
   };
 }
@@ -258,10 +229,8 @@ async function runMultiple(url, runs, options) {
     }
 
     try {
-      const result = await measureLCP(url, options);
-      if (result && result.firstImage) {
-        results.push(result);
-      }
+      const result = await measureFeedImage(url, options);
+      results.push(result);
     } catch (err) {
       if (!options.json) {
         console.error(`\nRun ${i + 1} failed: ${err.message}`);
@@ -307,7 +276,7 @@ async function main() {
   const { url, runs, json, mobile } = options;
 
   if (!json) {
-    console.log(`\nMeasuring first image load for ${url}${mobile ? ' (mobile)' : ''}...`);
+    console.log(`\nMeasuring first feed image for ${url}${mobile ? ' (mobile)' : ''}...`);
     if (runs > 1) console.log(`Running ${runs} iterations...\n`);
   }
 
@@ -315,34 +284,32 @@ async function main() {
 
   if (results.length === 0) {
     if (json) {
-      console.log(JSON.stringify({ error: 'No CDN images found' }));
+      console.log(JSON.stringify({ error: 'No feed images detected' }));
     } else {
-      console.error('Failed to detect any CDN images');
+      console.error('Failed to detect feed images (no priority images with CDN src found)');
     }
     process.exit(1);
   }
 
-  const firstImageStats = calculateStats(results.map(r => r.firstImage.time));
-  const durationStats = calculateStats(results.map(r => r.firstImage.duration));
+  const timeStats = calculateStats(results.map(r => r.time));
+  const durationStats = calculateStats(results.map(r => r.duration).filter(Boolean));
   const lastResult = results[results.length - 1];
-  const rating = getRating(firstImageStats.avg);
-  const allStable = results.every(r => r.stable);
+  const rating = getRating(timeStats.avg);
 
   if (json) {
     console.log(JSON.stringify({
       url,
       mobile,
-      firstImage: {
-        time: firstImageStats.avg,
-        duration: durationStats.avg,
+      firstFeedImage: {
+        time: timeStats.avg,
+        downloadDuration: durationStats?.avg || null,
         rating,
-        size: lastResult.firstImage.size,
-        cached: lastResult.firstImage.cached,
-        url: lastResult.firstImage.url
+        size: lastResult.size,
+        cached: lastResult.cached,
+        url: lastResult.src
       },
-      stable: allStable,
       stats: runs > 1 ? {
-        time: firstImageStats,
+        time: timeStats,
         duration: durationStats
       } : undefined,
       timestamp: new Date().toISOString()
@@ -351,23 +318,24 @@ async function main() {
     const color = getColor(rating);
 
     console.log(`\n${BOLD}URL:${RESET} ${url}`);
-    console.log(`${BOLD}First Image:${RESET} ${color}${firstImageStats.avg.toFixed(0)}ms${RESET} (${rating})`);
-    console.log(`${BOLD}Download:${RESET} ${durationStats.avg.toFixed(0)}ms`);
-    console.log(`${BOLD}Size:${RESET} ${formatBytes(lastResult.firstImage.size)}${lastResult.firstImage.cached ? ' (cached)' : ''}`);
+    console.log(`${BOLD}First Feed Image:${RESET} ${color}${timeStats.avg.toFixed(0)}ms${RESET} (${rating})`);
 
-    if (!allStable) {
-      console.log(`${DIM}⚠ Warning: measurement may not be stable${RESET}`);
+    if (durationStats) {
+      console.log(`${BOLD}Download Time:${RESET} ${durationStats.avg.toFixed(0)}ms`);
     }
+    console.log(`${BOLD}Size:${RESET} ${formatBytes(lastResult.size)}${lastResult.cached ? ' (cached)' : ''}`);
 
     if (runs > 1) {
       console.log(`\n${BOLD}Stats (${results.length} runs):${RESET}`);
-      console.log(`  Time:     Min ${firstImageStats.min.toFixed(0)}ms | Max ${firstImageStats.max.toFixed(0)}ms | Median ${firstImageStats.median.toFixed(0)}ms`);
-      console.log(`  Download: Min ${durationStats.min.toFixed(0)}ms | Max ${durationStats.max.toFixed(0)}ms | Median ${durationStats.median.toFixed(0)}ms`);
+      console.log(`  Load Time: Min ${timeStats.min.toFixed(0)}ms | Max ${timeStats.max.toFixed(0)}ms | Median ${timeStats.median.toFixed(0)}ms`);
+      if (durationStats) {
+        console.log(`  Download:  Min ${durationStats.min.toFixed(0)}ms | Max ${durationStats.max.toFixed(0)}ms | Median ${durationStats.median.toFixed(0)}ms`);
+      }
     }
 
-    const shortUrl = lastResult.firstImage.url.length > 70
-      ? '...' + lastResult.firstImage.url.slice(-67)
-      : lastResult.firstImage.url;
+    const shortUrl = lastResult.src.length > 70
+      ? '...' + lastResult.src.slice(-67)
+      : lastResult.src;
     console.log(`\n${BOLD}Image:${RESET}`);
     console.log(`  ${DIM}${shortUrl}${RESET}`);
 
