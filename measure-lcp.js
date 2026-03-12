@@ -14,6 +14,7 @@ function parseArgs() {
     runs: 1,
     json: false,
     mobile: false,
+    watch: false,
     help: false
   };
 
@@ -25,6 +26,8 @@ function parseArgs() {
       options.json = true;
     } else if (arg === '--mobile' || arg === '-m') {
       options.mobile = true;
+    } else if (arg === '--watch' || arg === '-w') {
+      options.watch = true;
     } else if (arg === '--runs' || arg === '-r') {
       options.runs = parseInt(args[++i], 10) || 1;
     } else if (!arg.startsWith('-')) {
@@ -45,12 +48,14 @@ Arguments:
 Options:
   -r, --runs <number>    Number of runs to average (default: 1)
   -m, --mobile           Emulate mobile device
+  -w, --watch            Continuous monitoring (Ctrl+C to stop)
   -j, --json             Output results as JSON
   -h, --help             Show this help message
 
 Examples:
   lcp https://zora.co
   lcp zora.co --runs 3
+  lcp https://zora.co --watch
   lcp https://zora.co --mobile --json
 `);
 }
@@ -197,6 +202,47 @@ function calculateStats(values) {
   };
 }
 
+async function runWatch(url, options) {
+  const { json, mobile } = options;
+  let runCount = 0;
+
+  if (!json) {
+    console.log(`\nWatching ${url}${mobile ? ' (mobile)' : ''}... (Ctrl+C to stop)\n`);
+    console.log(`${DIM}Time${RESET}        ${DIM}Load${RESET}     ${DIM}Rating${RESET}`);
+    console.log(`${DIM}─────────────────────────────────${RESET}`);
+  }
+
+  while (true) {
+    runCount++;
+    const timestamp = new Date().toLocaleTimeString();
+
+    try {
+      const result = await measureFeedImage(url, options);
+      const rating = getRating(result.time);
+      const color = getColor(rating);
+
+      if (json) {
+        console.log(JSON.stringify({
+          run: runCount,
+          time: result.time,
+          rating,
+          timestamp: new Date().toISOString()
+        }));
+      } else {
+        console.log(`${timestamp}   ${color}${result.time.toString().padStart(5)}ms${RESET}   ${rating}`);
+      }
+    } catch (err) {
+      if (json) {
+        console.log(JSON.stringify({ run: runCount, error: err.message }));
+      } else {
+        console.log(`${timestamp}   ${DIM}error${RESET}    ${err.message}`);
+      }
+    }
+
+    await new Promise(r => setTimeout(r, 1000));
+  }
+}
+
 async function main() {
   const options = parseArgs();
 
@@ -205,7 +251,12 @@ async function main() {
     process.exit(0);
   }
 
-  const { url, runs, json, mobile } = options;
+  const { url, runs, json, mobile, watch } = options;
+
+  if (watch) {
+    await runWatch(url, options);
+    return;
+  }
 
   if (!json) {
     console.log(`\nMeasuring first feed image for ${url}${mobile ? ' (mobile)' : ''}...`);
