@@ -90,123 +90,52 @@ async function measureFeedImage(url, options = {}) {
     await page.setViewport({ width: 1920, height: 1080 });
   }
 
-  // Track when the first CDN image loads
-  await page.evaluateOnNewDocument(() => {
-    window.__FEED_PERF__ = {
-      navigationStart: performance.now(),
-      firstFeedImage: null
-    };
-
-    // Watch for CDN images as they're added to the DOM
-    const observer = new MutationObserver((mutations) => {
-      if (window.__FEED_PERF__.firstFeedImage) return; // Already found one
-
-      for (const mutation of mutations) {
-        for (const node of mutation.addedNodes) {
-          if (node.nodeType !== Node.ELEMENT_NODE) continue;
-
-          const imgs = node.tagName === 'IMG' ? [node] : (node.querySelectorAll?.('img') || []);
-
-          for (const img of imgs) {
-            const src = img.src || '';
-            const isCDN = src.includes('choicecdn.com');
-
-            if (isCDN && !window.__FEED_PERF__.firstFeedImage) {
-              if (img.complete && img.naturalWidth > 0) {
-                // Already loaded
-                window.__FEED_PERF__.firstFeedImage = {
-                  loadedAt: performance.now(),
-                  src: src,
-                  wasComplete: true
-                };
-              } else {
-                // Wait for load
-                img.addEventListener('load', () => {
-                  if (!window.__FEED_PERF__.firstFeedImage) {
-                    window.__FEED_PERF__.firstFeedImage = {
-                      loadedAt: performance.now(),
-                      src: src,
-                      wasComplete: false
-                    };
-                  }
-                }, { once: true });
-              }
-              return; // Stop after finding first CDN image
-            }
-          }
-        }
-      }
-    });
-
-    observer.observe(document.documentElement, {
-      childList: true,
-      subtree: true
-    });
-  });
-
-  const startTime = Date.now();
-
   try {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    // Wait for network to be mostly idle
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
   } catch (err) {
     await browser.close();
     throw new Error(`Failed to load ${url}: ${err.message}`);
   }
 
-  // Wait for first feed image to load
+  // Poll for first CDN image in Resource Timing
   const pollStart = Date.now();
   let result = null;
 
   while (Date.now() - pollStart < TIMEOUT) {
     result = await page.evaluate(() => {
-      const perf = window.__FEED_PERF__;
-      if (perf.firstFeedImage) {
+      const entries = performance.getEntriesByType('resource');
+
+      // Find first choicecdn.com image (sorted by responseEnd)
+      const cdnImages = entries
+        .filter(e => e.initiatorType === 'img' && e.name.includes('choicecdn.com'))
+        .sort((a, b) => a.responseEnd - b.responseEnd);
+
+      if (cdnImages.length > 0) {
+        const first = cdnImages[0];
         return {
-          time: Math.round(perf.firstFeedImage.loadedAt),
-          src: perf.firstFeedImage.src,
-          wasAlreadyComplete: perf.firstFeedImage.wasComplete
+          time: Math.round(first.responseEnd),
+          duration: Math.round(first.duration),
+          size: first.encodedBodySize,
+          cached: first.transferSize === 0,
+          src: first.name
         };
       }
       return null;
     });
 
     if (result) break;
-    await new Promise(r => setTimeout(r, 100));
+    await new Promise(r => setTimeout(r, 200));
   }
-
-  // Get Resource Timing data for the image
-  let resourceTiming = null;
-  if (result?.src) {
-    resourceTiming = await page.evaluate((imgSrc) => {
-      const entries = performance.getEntriesByType('resource');
-      const entry = entries.find(e => e.name === imgSrc);
-      if (entry) {
-        return {
-          duration: Math.round(entry.duration),
-          transferSize: entry.transferSize,
-          encodedSize: entry.encodedBodySize,
-          cached: entry.transferSize === 0
-        };
-      }
-      return null;
-    }, result.src);
-  }
-
-  const loadTime = Date.now() - startTime;
 
   await browser.close();
 
   if (!result) {
-    throw new Error('Timed out waiting for first feed image');
+    throw new Error('No CDN images found in Resource Timing');
   }
 
   return {
-    time: result.time,
-    src: result.src,
-    duration: resourceTiming?.duration || null,
-    size: resourceTiming?.encodedSize || null,
-    cached: resourceTiming?.cached || false,
-    loadTime,
+    ...result,
     timestamp: new Date().toISOString()
   };
 }
