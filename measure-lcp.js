@@ -71,6 +71,14 @@ function getColor(rating) {
 }
 
 const RESET = '\x1b[0m';
+const DIM = '\x1b[2m';
+
+// Default stability settings
+const STABILITY = {
+  timeout: 15000,        // Max time to wait for stable LCP
+  stableThreshold: 2000, // LCP must not change for this long
+  pollInterval: 200      // How often to check stability
+};
 
 async function measureLCP(url, options = {}) {
   const browser = await puppeteer.launch({
@@ -86,30 +94,93 @@ async function measureLCP(url, options = {}) {
     await page.setViewport({ width: 1920, height: 1080 });
   }
 
-  // Inject LCP observer before navigation
+  // Inject tracking before navigation
   await page.evaluateOnNewDocument(() => {
-    window.__LCP_ENTRIES__ = [];
+    // Track LCP entries
+    window.__LCP__ = {
+      entries: [],
+      lastChangeTime: Date.now()
+    };
     new PerformanceObserver((list) => {
       for (const entry of list.getEntries()) {
-        window.__LCP_ENTRIES__.push(entry);
+        window.__LCP__.entries.push(entry);
+        window.__LCP__.lastChangeTime = Date.now();
       }
     }).observe({ type: 'largest-contentful-paint', buffered: true });
+
+    // Track pending fetch requests
+    window.__pendingFetches__ = 0;
+    const origFetch = window.fetch;
+    window.fetch = async (...args) => {
+      window.__pendingFetches__++;
+      try {
+        return await origFetch(...args);
+      } finally {
+        window.__pendingFetches__--;
+      }
+    };
+
+    // Track pending XHR requests
+    window.__pendingXHR__ = 0;
+    const origXHROpen = XMLHttpRequest.prototype.open;
+    const origXHRSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function(...args) {
+      this.__tracked__ = true;
+      return origXHROpen.apply(this, args);
+    };
+    XMLHttpRequest.prototype.send = function(...args) {
+      if (this.__tracked__) {
+        window.__pendingXHR__++;
+        this.addEventListener('loadend', () => {
+          window.__pendingXHR__--;
+        }, { once: true });
+      }
+      return origXHRSend.apply(this, args);
+    };
   });
 
   const startTime = Date.now();
 
   try {
-    await page.goto(url, { waitUntil: 'networkidle0', timeout: 60000 });
+    // Use domcontentloaded instead of networkidle0 since we have our own stability check
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
   } catch (err) {
     await browser.close();
     throw new Error(`Failed to load ${url}: ${err.message}`);
   }
 
-  // Wait for LCP to settle (no user input, so LCP finalizes on load)
-  await new Promise(r => setTimeout(r, 1500));
+  // Wait for stable LCP: no pending requests AND LCP unchanged for threshold
+  const stabilityStart = Date.now();
+  let stable = false;
+  let lastState = null;
 
+  while (Date.now() - stabilityStart < STABILITY.timeout) {
+    const state = await page.evaluate(() => {
+      const lastEntry = window.__LCP__.entries[window.__LCP__.entries.length - 1];
+      return {
+        pendingFetches: window.__pendingFetches__,
+        pendingXHR: window.__pendingXHR__,
+        lcpTime: lastEntry?.startTime || null,
+        lcpAge: Date.now() - window.__LCP__.lastChangeTime,
+        lcpCount: window.__LCP__.entries.length
+      };
+    });
+
+    lastState = state;
+    const pendingRequests = state.pendingFetches + state.pendingXHR;
+
+    // Stable when: we have LCP, no pending requests, and LCP hasn't changed
+    if (state.lcpTime && pendingRequests === 0 && state.lcpAge >= STABILITY.stableThreshold) {
+      stable = true;
+      break;
+    }
+
+    await new Promise(r => setTimeout(r, STABILITY.pollInterval));
+  }
+
+  // Extract final LCP data
   const lcp = await page.evaluate(() => {
-    const entries = window.__LCP_ENTRIES__;
+    const entries = window.__LCP__.entries;
     if (!entries || entries.length === 0) return null;
 
     const lastEntry = entries[entries.length - 1];
@@ -119,7 +190,8 @@ async function measureLCP(url, options = {}) {
       id: lastEntry.element?.id || null,
       className: lastEntry.element?.className || null,
       size: lastEntry.size,
-      url: lastEntry.url || null
+      url: lastEntry.url || null,
+      lcpCandidates: entries.length
     };
   });
 
@@ -130,6 +202,7 @@ async function measureLCP(url, options = {}) {
   return {
     ...lcp,
     loadTime,
+    stable,
     timestamp: new Date().toISOString()
   };
 }
@@ -207,6 +280,8 @@ async function main() {
   const lastResult = results[results.length - 1];
   const rating = getRating(stats.avg);
 
+  const allStable = results.every(r => r.stable);
+
   if (json) {
     console.log(JSON.stringify({
       url,
@@ -218,8 +293,10 @@ async function main() {
         elementId: lastResult.id,
         elementClass: lastResult.className,
         size: lastResult.size,
-        resourceUrl: lastResult.url
+        resourceUrl: lastResult.url,
+        candidates: lastResult.lcpCandidates
       },
+      stable: allStable,
       stats: runs > 1 ? stats : undefined,
       timestamp: new Date().toISOString()
     }, null, 2));
@@ -228,6 +305,10 @@ async function main() {
 
     console.log(`URL: ${url}`);
     console.log(`LCP: ${color}${stats.avg.toFixed(0)}ms${RESET} (${rating})`);
+
+    if (!allStable) {
+      console.log(`${DIM}⚠ Warning: LCP may not be stable (timed out waiting for network/rendering)${RESET}`);
+    }
 
     if (runs > 1) {
       console.log(`\nStats (${stats.runs} runs):`);
@@ -243,6 +324,7 @@ async function main() {
     if (lastResult.className) console.log(`  Class: .${lastResult.className.split(' ')[0]}`);
     console.log(`  Size: ${lastResult.size.toLocaleString()} px²`);
     if (lastResult.url) console.log(`  Resource: ${lastResult.url}`);
+    console.log(`  ${DIM}Candidates evaluated: ${lastResult.lcpCandidates}${RESET}`);
 
     console.log(`\nThresholds: good ≤${THRESHOLDS.good}ms, poor >${THRESHOLDS.needsImprovement}ms`);
   }

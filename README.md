@@ -70,6 +70,22 @@ Based on [Web Vitals](https://web.dev/lcp/):
 - **Needs Improvement**: 2500ms - 4000ms
 - **Poor**: > 4000ms
 
+## How it works
+
+Unlike naive implementations that use a fixed wait time, this tool waits for LCP to truly stabilize by monitoring:
+
+1. **Network requests** - Tracks all `fetch()` and `XMLHttpRequest` calls
+2. **LCP changes** - Monitors the PerformanceObserver for new LCP candidates
+
+LCP is considered stable when:
+- All pending network requests have completed
+- The LCP element hasn't changed for 2 seconds
+- Both conditions are true simultaneously
+
+This handles SPAs and data-driven pages that render content after API responses.
+
+If stability can't be achieved within 15 seconds, a warning is shown and the current LCP is reported.
+
 ## License
 
 MIT
