@@ -4,7 +4,7 @@ Measure time to first feed image for zora.co using headless Chrome.
 
 ## What it measures
 
-Specifically tracks the **first priority image in the feed** - the image with `fetchpriority="high"` and `loading="eager"` from the CDN (choicecdn.com). This is the first post's image that users see when the feed loads.
+Tracks the **first feed image** to load - large images (≥500px width) from the CDN (choicecdn.com). This is the first post's image that users see when the feed loads. Mobile uses 540px images, desktop uses 1200px images.
 
 ## Install
 
@@ -43,23 +43,20 @@ node measure-lcp.js https://zora.co --json
 
 ```
 URL: https://zora.co
-First Feed Image: 1847ms (good)
-Download Time: 423ms
-Size: 112.3 KB
+First Feed Image: 4371ms (poor)
+Dimensions: 1024x1024
 
 Image:
-  .../rs:fill:1200:1600/g:ce/f:webp/aHR0cHM6Ly9tYWdpYy5...
+  .../rs:fill:1200:1200/g:ce/f:webp/aHR0cHM6Ly9tYWdpYy5...
 
 Thresholds: good ≤2500ms, poor >4000ms
 ```
 
 ## How it works
 
-1. Uses MutationObserver to watch for `<img>` elements as they're added to the DOM
-2. Identifies the first image with:
-   - `fetchpriority="high"` OR `loading="eager"`
-   - Source URL containing `choicecdn.com`, `decentralized-content.com`, or `ipfs`
-3. Attaches a load event listener to capture when the image finishes loading
+1. Navigates to the page with headless Chrome
+2. Polls the DOM for the first feed image (large CDN images ≥500px width)
+3. Waits for the image to fully load (`complete` and `naturalWidth > 0`)
 4. Reports the time from navigation start to image load completion
 
 ## Thresholds

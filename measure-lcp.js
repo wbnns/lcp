@@ -90,48 +90,67 @@ async function measureFeedImage(url, options = {}) {
     await page.setViewport({ width: 1920, height: 1080 });
   }
 
+  // Record navigation start time
+  const navStart = Date.now();
+
   try {
-    // Wait for network to be mostly idle
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
   } catch (err) {
     await browser.close();
     throw new Error(`Failed to load ${url}: ${err.message}`);
   }
 
-  // Poll for first CDN image in Resource Timing
+  // Poll for the first feed image to be loaded
   const pollStart = Date.now();
   let result = null;
 
   while (Date.now() - pollStart < TIMEOUT) {
     result = await page.evaluate(() => {
-      const entries = performance.getEntriesByType('resource');
+      // Find all CDN images in the feed
+      // Feed images use rs:fill with larger sizes (540+ for mobile, 1200 for desktop)
+      // Avatars are typically 128x128 or 360x360
+      const images = Array.from(document.querySelectorAll('img'));
 
-      // Find first choicecdn.com image (sorted by responseEnd)
-      const cdnImages = entries
-        .filter(e => e.initiatorType === 'img' && e.name.includes('choicecdn.com'))
-        .sort((a, b) => a.responseEnd - b.responseEnd);
+      for (const img of images) {
+        const src = img.src || '';
+        if (!src.includes('choicecdn.com')) continue;
 
-      if (cdnImages.length > 0) {
-        const first = cdnImages[0];
-        return {
-          time: Math.round(first.responseEnd),
-          duration: Math.round(first.duration),
-          size: first.encodedBodySize,
-          cached: first.transferSize === 0,
-          src: first.name
-        };
+        // Extract dimensions from imgproxy URL: rs:fill:WIDTHxHEIGHT or rs:fill:WIDTH:HEIGHT
+        const match = src.match(/rs:fill:(\d+)[x:](\d+)/);
+        if (!match) continue;
+
+        const width = parseInt(match[1], 10);
+        // Feed images are 540+ px wide (mobile: 540, desktop: 1200)
+        // Avatars are smaller (128, 360)
+        if (width >= 500) {
+          if (img.complete && img.naturalWidth > 0) {
+            return {
+              src: img.src,
+              naturalWidth: img.naturalWidth,
+              naturalHeight: img.naturalHeight,
+              fetchPriority: img.fetchPriority,
+              loading: img.loading
+            };
+          }
+          // Found a feed image but it's not loaded yet
+          return null;
+        }
       }
       return null;
     });
 
-    if (result) break;
-    await new Promise(r => setTimeout(r, 200));
+    if (result) {
+      // Calculate time from navigation start
+      result.time = Date.now() - navStart;
+      break;
+    }
+    await new Promise(r => setTimeout(r, 50));
   }
 
   await browser.close();
 
   if (!result) {
-    throw new Error('No CDN images found in Resource Timing');
+    throw new Error('No feed image detected');
   }
 
   return {
@@ -178,13 +197,6 @@ function calculateStats(values) {
   };
 }
 
-function formatBytes(bytes) {
-  if (!bytes) return 'N/A';
-  if (bytes < 1024) return bytes + ' B';
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-  return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
-}
-
 async function main() {
   const options = parseArgs();
 
@@ -212,7 +224,6 @@ async function main() {
   }
 
   const timeStats = calculateStats(results.map(r => r.time));
-  const durationStats = calculateStats(results.map(r => r.duration).filter(Boolean));
   const lastResult = results[results.length - 1];
   const rating = getRating(timeStats.avg);
 
@@ -222,16 +233,13 @@ async function main() {
       mobile,
       firstFeedImage: {
         time: timeStats.avg,
-        downloadDuration: durationStats?.avg || null,
         rating,
-        size: lastResult.size,
-        cached: lastResult.cached,
+        dimensions: lastResult.naturalWidth && lastResult.naturalHeight
+          ? `${lastResult.naturalWidth}x${lastResult.naturalHeight}`
+          : null,
         url: lastResult.src
       },
-      stats: runs > 1 ? {
-        time: timeStats,
-        duration: durationStats
-      } : undefined,
+      stats: runs > 1 ? { time: timeStats } : undefined,
       timestamp: new Date().toISOString()
     }, null, 2));
   } else {
@@ -240,17 +248,13 @@ async function main() {
     console.log(`\n${BOLD}URL:${RESET} ${url}`);
     console.log(`${BOLD}First Feed Image:${RESET} ${color}${timeStats.avg.toFixed(0)}ms${RESET} (${rating})`);
 
-    if (durationStats) {
-      console.log(`${BOLD}Download Time:${RESET} ${durationStats.avg.toFixed(0)}ms`);
+    if (lastResult.naturalWidth && lastResult.naturalHeight) {
+      console.log(`${BOLD}Dimensions:${RESET} ${lastResult.naturalWidth}x${lastResult.naturalHeight}`);
     }
-    console.log(`${BOLD}Size:${RESET} ${formatBytes(lastResult.size)}${lastResult.cached ? ' (cached)' : ''}`);
 
     if (runs > 1) {
       console.log(`\n${BOLD}Stats (${results.length} runs):${RESET}`);
       console.log(`  Load Time: Min ${timeStats.min.toFixed(0)}ms | Max ${timeStats.max.toFixed(0)}ms | Median ${timeStats.median.toFixed(0)}ms`);
-      if (durationStats) {
-        console.log(`  Download:  Min ${durationStats.min.toFixed(0)}ms | Max ${durationStats.max.toFixed(0)}ms | Median ${durationStats.median.toFixed(0)}ms`);
-      }
     }
 
     const shortUrl = lastResult.src.length > 70
