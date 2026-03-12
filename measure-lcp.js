@@ -14,6 +14,8 @@ function parseArgs() {
     runs: 1,
     json: false,
     mobile: false,
+    feed: false,
+    feedImages: 5,
     help: false
   };
 
@@ -25,6 +27,10 @@ function parseArgs() {
       options.json = true;
     } else if (arg === '--mobile' || arg === '-m') {
       options.mobile = true;
+    } else if (arg === '--feed' || arg === '-f') {
+      options.feed = true;
+    } else if (arg === '--feed-images' || arg === '-fi') {
+      options.feedImages = parseInt(args[++i], 10) || 5;
     } else if (arg === '--runs' || arg === '-r') {
       options.runs = parseInt(args[++i], 10) || 1;
     } else if (!arg.startsWith('-')) {
@@ -40,18 +46,21 @@ function showHelp() {
 Usage: lcp [url] [options]
 
 Arguments:
-  url                    URL to measure (default: https://zora.co)
+  url                       URL to measure (default: https://zora.co)
 
 Options:
-  -r, --runs <number>    Number of runs to average (default: 1)
-  -m, --mobile           Emulate mobile device
-  -j, --json             Output results as JSON
-  -h, --help             Show this help message
+  -r, --runs <number>       Number of runs to average (default: 1)
+  -m, --mobile              Emulate mobile device
+  -f, --feed                Enable feed mode: track image loading times
+  -fi, --feed-images <n>    Number of feed images to wait for (default: 5)
+  -j, --json                Output results as JSON
+  -h, --help                Show this help message
 
 Examples:
   lcp https://zora.co
-  lcp zora.co --runs 3
-  lcp https://zora.co/@user --mobile --json
+  lcp zora.co --feed
+  lcp zora.co --feed --feed-images 10 --json
+  lcp https://zora.co/@user --mobile --runs 3
 `);
 }
 
@@ -72,10 +81,11 @@ function getColor(rating) {
 
 const RESET = '\x1b[0m';
 const DIM = '\x1b[2m';
+const BOLD = '\x1b[1m';
 
 // Default stability settings
 const STABILITY = {
-  timeout: 15000,        // Max time to wait for stable LCP
+  timeout: 20000,        // Max time to wait for stable LCP
   stableThreshold: 2000, // LCP must not change for this long
   pollInterval: 200      // How often to check stability
 };
@@ -96,32 +106,69 @@ async function measureLCP(url, options = {}) {
 
   // Inject tracking before navigation
   await page.evaluateOnNewDocument(() => {
-    // Track LCP entries
-    window.__LCP__ = {
-      entries: [],
-      lastChangeTime: Date.now()
+    window.__PERF__ = {
+      navigationStart: performance.now(),
+
+      // LCP tracking
+      lcp: {
+        entries: [],
+        lastChangeTime: Date.now()
+      },
+
+      // Image tracking (for feed mode)
+      images: {
+        started: [],   // { url, startTime }
+        completed: [], // { url, startTime, endTime, duration, size, cached }
+        failed: []     // { url, startTime, error }
+      },
+
+      // Network tracking
+      pendingFetches: 0,
+      pendingXHR: 0
     };
+
+    // Track LCP
     new PerformanceObserver((list) => {
       for (const entry of list.getEntries()) {
-        window.__LCP__.entries.push(entry);
-        window.__LCP__.lastChangeTime = Date.now();
+        window.__PERF__.lcp.entries.push(entry);
+        window.__PERF__.lcp.lastChangeTime = Date.now();
       }
     }).observe({ type: 'largest-contentful-paint', buffered: true });
 
-    // Track pending fetch requests
-    window.__pendingFetches__ = 0;
+    // Track image loads via PerformanceObserver
+    new PerformanceObserver((list) => {
+      for (const entry of list.getEntries()) {
+        if (entry.initiatorType === 'img') {
+          const isCDN = entry.name.includes('choicecdn.com') ||
+                        entry.name.includes('decentralized-content.com') ||
+                        entry.name.includes('ipfs');
+
+          window.__PERF__.images.completed.push({
+            url: entry.name,
+            startTime: entry.startTime,
+            endTime: entry.responseEnd,
+            duration: entry.responseEnd - entry.startTime,
+            transferSize: entry.transferSize,
+            encodedSize: entry.encodedBodySize,
+            cached: entry.transferSize === 0,
+            isCDN
+          });
+        }
+      }
+    }).observe({ type: 'resource', buffered: true });
+
+    // Track fetch requests
     const origFetch = window.fetch;
     window.fetch = async (...args) => {
-      window.__pendingFetches__++;
+      window.__PERF__.pendingFetches++;
       try {
         return await origFetch(...args);
       } finally {
-        window.__pendingFetches__--;
+        window.__PERF__.pendingFetches--;
       }
     };
 
-    // Track pending XHR requests
-    window.__pendingXHR__ = 0;
+    // Track XHR requests
     const origXHROpen = XMLHttpRequest.prototype.open;
     const origXHRSend = XMLHttpRequest.prototype.send;
     XMLHttpRequest.prototype.open = function(...args) {
@@ -130,9 +177,9 @@ async function measureLCP(url, options = {}) {
     };
     XMLHttpRequest.prototype.send = function(...args) {
       if (this.__tracked__) {
-        window.__pendingXHR__++;
+        window.__PERF__.pendingXHR++;
         this.addEventListener('loadend', () => {
-          window.__pendingXHR__--;
+          window.__PERF__.pendingXHR--;
         }, { once: true });
       }
       return origXHRSend.apply(this, args);
@@ -142,35 +189,41 @@ async function measureLCP(url, options = {}) {
   const startTime = Date.now();
 
   try {
-    // Use domcontentloaded instead of networkidle0 since we have our own stability check
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
   } catch (err) {
     await browser.close();
     throw new Error(`Failed to load ${url}: ${err.message}`);
   }
 
-  // Wait for stable LCP: no pending requests AND LCP unchanged for threshold
+  // Wait for stable state
   const stabilityStart = Date.now();
   let stable = false;
-  let lastState = null;
+  const feedImagesTarget = options.feed ? (options.feedImages || 5) : 0;
 
   while (Date.now() - stabilityStart < STABILITY.timeout) {
-    const state = await page.evaluate(() => {
-      const lastEntry = window.__LCP__.entries[window.__LCP__.entries.length - 1];
-      return {
-        pendingFetches: window.__pendingFetches__,
-        pendingXHR: window.__pendingXHR__,
-        lcpTime: lastEntry?.startTime || null,
-        lcpAge: Date.now() - window.__LCP__.lastChangeTime,
-        lcpCount: window.__LCP__.entries.length
-      };
-    });
+    const state = await page.evaluate((feedMode) => {
+      const perf = window.__PERF__;
+      const lastLCP = perf.lcp.entries[perf.lcp.entries.length - 1];
+      const cdnImages = perf.images.completed.filter(img => img.isCDN);
 
-    lastState = state;
+      return {
+        pendingFetches: perf.pendingFetches,
+        pendingXHR: perf.pendingXHR,
+        lcpTime: lastLCP?.startTime || null,
+        lcpAge: Date.now() - perf.lcp.lastChangeTime,
+        lcpCount: perf.lcp.entries.length,
+        totalImages: perf.images.completed.length,
+        cdnImages: cdnImages.length,
+        feedMode
+      };
+    }, options.feed);
+
     const pendingRequests = state.pendingFetches + state.pendingXHR;
 
-    // Stable when: we have LCP, no pending requests, and LCP hasn't changed
-    if (state.lcpTime && pendingRequests === 0 && state.lcpAge >= STABILITY.stableThreshold) {
+    // In feed mode, also wait for N CDN images
+    const feedReady = !options.feed || state.cdnImages >= feedImagesTarget;
+
+    if (state.lcpTime && pendingRequests === 0 && state.lcpAge >= STABILITY.stableThreshold && feedReady) {
       stable = true;
       break;
     }
@@ -178,20 +231,56 @@ async function measureLCP(url, options = {}) {
     await new Promise(r => setTimeout(r, STABILITY.pollInterval));
   }
 
-  // Extract final LCP data
-  const lcp = await page.evaluate(() => {
-    const entries = window.__LCP__.entries;
-    if (!entries || entries.length === 0) return null;
+  // Extract all performance data
+  const perfData = await page.evaluate(() => {
+    const perf = window.__PERF__;
+    const entries = perf.lcp.entries;
+    const lastLCP = entries[entries.length - 1];
 
-    const lastEntry = entries[entries.length - 1];
+    // Sort images by endTime to get loading order
+    const cdnImages = perf.images.completed
+      .filter(img => img.isCDN)
+      .sort((a, b) => a.endTime - b.endTime);
+
+    // Calculate feed-specific metrics
+    const feedMetrics = cdnImages.length > 0 ? {
+      firstImageTime: cdnImages[0]?.endTime,
+      thirdImageTime: cdnImages[2]?.endTime,
+      fifthImageTime: cdnImages[4]?.endTime,
+      tenthImageTime: cdnImages[9]?.endTime,
+      images: cdnImages.slice(0, 10).map(img => ({
+        url: img.url.length > 80 ? img.url.substring(0, 80) + '...' : img.url,
+        duration: Math.round(img.duration),
+        size: img.encodedSize,
+        cached: img.cached,
+        loadedAt: Math.round(img.endTime)
+      }))
+    } : null;
+
+    // Find slowest images
+    const slowestImages = [...cdnImages]
+      .sort((a, b) => b.duration - a.duration)
+      .slice(0, 5)
+      .map(img => ({
+        url: img.url.length > 60 ? '...' + img.url.slice(-57) : img.url,
+        duration: Math.round(img.duration),
+        size: img.encodedSize
+      }));
+
     return {
-      time: lastEntry.startTime,
-      element: lastEntry.element?.tagName || 'unknown',
-      id: lastEntry.element?.id || null,
-      className: lastEntry.element?.className || null,
-      size: lastEntry.size,
-      url: lastEntry.url || null,
-      lcpCandidates: entries.length
+      lcp: lastLCP ? {
+        time: lastLCP.startTime,
+        element: lastLCP.element?.tagName || 'unknown',
+        id: lastLCP.element?.id || null,
+        className: lastLCP.element?.className || null,
+        size: lastLCP.size,
+        url: lastLCP.url || null,
+        lcpCandidates: entries.length
+      } : null,
+      feed: feedMetrics,
+      slowestImages,
+      totalCDNImages: cdnImages.length,
+      totalImages: perf.images.completed.length
     };
   });
 
@@ -200,7 +289,7 @@ async function measureLCP(url, options = {}) {
   await browser.close();
 
   return {
-    ...lcp,
+    ...perfData,
     loadTime,
     stable,
     timestamp: new Date().toISOString()
@@ -217,7 +306,7 @@ async function runMultiple(url, runs, options) {
 
     try {
       const result = await measureLCP(url, options);
-      if (result && result.time) {
+      if (result && result.lcp) {
         results.push(result);
       }
     } catch (err) {
@@ -228,26 +317,30 @@ async function runMultiple(url, runs, options) {
   }
 
   if (!options.json && runs > 1) {
-    process.stdout.write('\r\x1b[K'); // Clear line
+    process.stdout.write('\r\x1b[K');
   }
 
   return results;
 }
 
-function calculateStats(results) {
-  if (results.length === 0) return null;
-
-  const times = results.map(r => r.time).sort((a, b) => a - b);
-  const sum = times.reduce((a, b) => a + b, 0);
-
+function calculateStats(values) {
+  if (!values || values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const sum = sorted.reduce((a, b) => a + b, 0);
   return {
-    min: times[0],
-    max: times[times.length - 1],
-    avg: sum / times.length,
-    median: times[Math.floor(times.length / 2)],
-    p75: times[Math.floor(times.length * 0.75)] || times[times.length - 1],
-    runs: results.length
+    min: sorted[0],
+    max: sorted[sorted.length - 1],
+    avg: sum / sorted.length,
+    median: sorted[Math.floor(sorted.length / 2)],
+    p75: sorted[Math.floor(sorted.length * 0.75)] || sorted[sorted.length - 1]
   };
+}
+
+function formatBytes(bytes) {
+  if (!bytes) return 'N/A';
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
 }
 
 async function main() {
@@ -258,75 +351,119 @@ async function main() {
     process.exit(0);
   }
 
-  const { url, runs, json, mobile } = options;
+  const { url, runs, json, mobile, feed, feedImages } = options;
 
   if (!json) {
-    console.log(`\nMeasuring LCP for ${url}${mobile ? ' (mobile)' : ''}...`);
+    console.log(`\nMeasuring ${feed ? 'feed performance' : 'LCP'} for ${url}${mobile ? ' (mobile)' : ''}...`);
+    if (feed) console.log(`Waiting for ${feedImages} feed images to load...`);
     if (runs > 1) console.log(`Running ${runs} iterations...\n`);
   }
 
-  const results = await runMultiple(url, runs, { mobile, json });
+  const results = await runMultiple(url, runs, options);
 
   if (results.length === 0) {
     if (json) {
-      console.log(JSON.stringify({ error: 'No LCP data collected' }));
+      console.log(JSON.stringify({ error: 'No data collected' }));
     } else {
-      console.error('Failed to collect LCP data');
+      console.error('Failed to collect data');
     }
     process.exit(1);
   }
 
-  const stats = calculateStats(results);
+  const lcpStats = calculateStats(results.map(r => r.lcp.time));
   const lastResult = results[results.length - 1];
-  const rating = getRating(stats.avg);
-
+  const rating = getRating(lcpStats.avg);
   const allStable = results.every(r => r.stable);
+
+  // Feed-specific stats
+  let feedStats = null;
+  if (feed && lastResult.feed) {
+    feedStats = {
+      firstImage: calculateStats(results.map(r => r.feed?.firstImageTime).filter(Boolean)),
+      thirdImage: calculateStats(results.map(r => r.feed?.thirdImageTime).filter(Boolean)),
+      fifthImage: calculateStats(results.map(r => r.feed?.fifthImageTime).filter(Boolean))
+    };
+  }
 
   if (json) {
     console.log(JSON.stringify({
       url,
       mobile,
       lcp: {
-        value: stats.avg,
+        value: lcpStats.avg,
         rating,
-        element: lastResult.element,
-        elementId: lastResult.id,
-        elementClass: lastResult.className,
-        size: lastResult.size,
-        resourceUrl: lastResult.url,
-        candidates: lastResult.lcpCandidates
+        element: lastResult.lcp.element,
+        elementId: lastResult.lcp.id,
+        size: lastResult.lcp.size,
+        resourceUrl: lastResult.lcp.url,
+        candidates: lastResult.lcp.lcpCandidates
       },
+      feed: feed ? {
+        imagesLoaded: lastResult.totalCDNImages,
+        firstImageTime: feedStats?.firstImage?.avg,
+        thirdImageTime: feedStats?.thirdImage?.avg,
+        fifthImageTime: feedStats?.fifthImage?.avg,
+        slowestImages: lastResult.slowestImages,
+        images: lastResult.feed?.images
+      } : undefined,
       stable: allStable,
-      stats: runs > 1 ? stats : undefined,
+      stats: runs > 1 ? { lcp: lcpStats, feed: feedStats } : undefined,
       timestamp: new Date().toISOString()
     }, null, 2));
   } else {
     const color = getColor(rating);
 
-    console.log(`URL: ${url}`);
-    console.log(`LCP: ${color}${stats.avg.toFixed(0)}ms${RESET} (${rating})`);
+    console.log(`\n${BOLD}URL:${RESET} ${url}`);
+    console.log(`${BOLD}LCP:${RESET} ${color}${lcpStats.avg.toFixed(0)}ms${RESET} (${rating})`);
 
     if (!allStable) {
-      console.log(`${DIM}⚠ Warning: LCP may not be stable (timed out waiting for network/rendering)${RESET}`);
+      console.log(`${DIM}⚠ Warning: measurement may not be stable${RESET}`);
     }
 
     if (runs > 1) {
-      console.log(`\nStats (${stats.runs} runs):`);
-      console.log(`  Min:    ${stats.min.toFixed(0)}ms`);
-      console.log(`  Max:    ${stats.max.toFixed(0)}ms`);
-      console.log(`  Median: ${stats.median.toFixed(0)}ms`);
-      console.log(`  p75:    ${stats.p75.toFixed(0)}ms`);
+      console.log(`\n${BOLD}LCP Stats (${results.length} runs):${RESET}`);
+      console.log(`  Min: ${lcpStats.min.toFixed(0)}ms | Max: ${lcpStats.max.toFixed(0)}ms | Median: ${lcpStats.median.toFixed(0)}ms`);
     }
 
-    console.log(`\nLCP Element:`);
-    console.log(`  Tag:  <${lastResult.element.toLowerCase()}>`);
-    if (lastResult.id) console.log(`  ID:   #${lastResult.id}`);
-    if (lastResult.className) console.log(`  Class: .${lastResult.className.split(' ')[0]}`);
-    console.log(`  Size: ${lastResult.size.toLocaleString()} px²`);
-    if (lastResult.url) console.log(`  Resource: ${lastResult.url}`);
-    console.log(`  ${DIM}Candidates evaluated: ${lastResult.lcpCandidates}${RESET}`);
+    console.log(`\n${BOLD}LCP Element:${RESET}`);
+    console.log(`  Tag: <${lastResult.lcp.element.toLowerCase()}> | Size: ${lastResult.lcp.size?.toLocaleString()} px²`);
+    if (lastResult.lcp.url) {
+      const shortUrl = lastResult.lcp.url.length > 60 ? '...' + lastResult.lcp.url.slice(-57) : lastResult.lcp.url;
+      console.log(`  Resource: ${DIM}${shortUrl}${RESET}`);
+    }
 
-    console.log(`\nThresholds: good ≤${THRESHOLDS.good}ms, poor >${THRESHOLDS.needsImprovement}ms`);
+    if (feed && lastResult.feed) {
+      console.log(`\n${BOLD}Feed Performance:${RESET}`);
+      console.log(`  Images loaded: ${lastResult.totalCDNImages} CDN images (${lastResult.totalImages} total)`);
+
+      if (feedStats?.firstImage) {
+        console.log(`  1st image ready: ${feedStats.firstImage.avg.toFixed(0)}ms`);
+      }
+      if (feedStats?.thirdImage) {
+        console.log(`  3rd image ready: ${feedStats.thirdImage.avg.toFixed(0)}ms`);
+      }
+      if (feedStats?.fifthImage) {
+        console.log(`  5th image ready: ${feedStats.fifthImage.avg.toFixed(0)}ms`);
+      }
+
+      if (lastResult.slowestImages && lastResult.slowestImages.length > 0) {
+        console.log(`\n${BOLD}Slowest Images:${RESET}`);
+        lastResult.slowestImages.forEach((img, i) => {
+          console.log(`  ${i + 1}. ${img.duration}ms (${formatBytes(img.size)})`);
+          console.log(`     ${DIM}${img.url}${RESET}`);
+        });
+      }
+
+      if (lastResult.feed?.images && lastResult.feed.images.length > 0) {
+        console.log(`\n${BOLD}Image Load Timeline:${RESET}`);
+        lastResult.feed.images.forEach((img, i) => {
+          const cached = img.cached ? ' (cached)' : '';
+          console.log(`  ${i + 1}. @${img.loadedAt}ms - ${img.duration}ms${cached} (${formatBytes(img.size)})`);
+        });
+      }
+    }
+
+    console.log(`\n${DIM}Thresholds: good ≤${THRESHOLDS.good}ms, poor >${THRESHOLDS.needsImprovement}ms${RESET}`);
   }
 }
 
