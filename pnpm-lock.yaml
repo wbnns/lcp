@@ -239,8 +239,8 @@ packages:
     resolution: {integrity: sha512-TR3KfrTZTYLPB6jUjfx6MF9WcWrHL9su5TObK4ZkYgBdWKPOFoSoQIdEuTuR82pmtxH2spWG9h6etwfr1pLBqQ==}
     engines: {node: '>=6'}
 
-  ip-address@10.1.0:
-    resolution: {integrity: sha512-XXADHxXmvT9+CRxhXg56LJovE+bmWnEWB78LB83VZTprKTmaC5QfruXocxzTZ2Kl0DNwKuBdlIhjL8LeY8Sf8Q==}
+  ip-address@10.7.5:
+    resolution: {integrity: sha512-t2v0rkILYv9WXmSL7TpAaU3HXgaFYOPUcH3QHgwQ++gpJuH3bqyMy4Fvt/DJCTKwzH3Cf+bAp5W/mFL39KPLzA==}
     engines: {node: '>= 12'}
 
   is-arrayish@0.2.1:
@@ -655,7 +655,7 @@ snapshots:
       parent-module: 1.0.1
       resolve-from: 4.0.0
 
-  ip-address@10.1.0: {}
+  ip-address@10.7.5: {}
 
   is-arrayish@0.2.1: {}
 
@@ -786,7 +786,7 @@ snapshots:
 
   socks@2.8.7:
     dependencies:
-      ip-address: 10.1.0
+      ip-address: 10.7.5
       smart-buffer: 4.2.0
 
   source-map@0.6.1:
